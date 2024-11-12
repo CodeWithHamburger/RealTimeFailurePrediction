@@ -1,0 +1,547 @@
+import pandas as pd
+import numpy as np
+import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+# from tensorflow.python.keras.models import Sequential
+# from tensorflow.python.keras.layers import LSTM, Dense, Dropout
+# from tensorflow.python.keras.optimizers.adam_v2 import Adam
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, roc_auc_score, balanced_accuracy_score
+from sklearn.utils import resample
+from dash import Dash, dcc, html, Input, Output
+import plotly.graph_objs as go
+import shap
+import random
+import os
+from sklearn.ensemble import RandomForestClassifier
+from keras.layers import LSTM, Dropout, Dense
+from keras.models import Model, Sequential
+from keras.optimizers import Adam
+import sys
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+import os
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, classification_report
+
+
+# os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+#
+# import tensorflow as tf
+#
+# pd.set_option('display.max_rows', 2)
+# pd.set_option('display.max_columns', None)
+# pd.set_option('display.width', None)
+# pd.set_option('display.max_colwidth', 100)
+#
+#
+# np.set_printoptions(threshold=sys.maxsize)
+
+# Инициализация Dash
+app = Dash(__name__)
+
+# Путь к CSV файлу
+csv_file = 'fulldata_milling.csv'
+new_data_from_sensors = 'new_data_from_sensors.csv'
+
+# Проверка наличия файла
+if not os.path.exists(csv_file):
+    # Если файл отсутствует, создаем пустой DataFrame с нужными столбцами
+    pd.DataFrame(columns=[
+        'UDI', 'Product ID', 'Type', 'Air temperature (K)', 'Process temperature (K)',
+        'Rotational speed (rpm)', 'Torque (Nm)', 'Tool wear (min)', 'Target', 'Failure Type'
+    ]).to_csv(csv_file, index=False)
+
+if not os.path.exists(new_data_from_sensors):
+    # Если файл отсутствует, создаем пустой DataFrame с нужными столбцами
+    pd.DataFrame(columns=[
+        'Air temperature (K)', 'Process temperature (K)', 'Rotational speed (rpm)', 'Torque (Nm)', 'Tool wear (min)',
+        'Type_H', 'Type_L', 'Type_M', 'Target', 'RUL'
+    ]).to_csv(new_data_from_sensors, index=False)
+
+# Чтение данных
+df = pd.read_csv(csv_file)
+
+# Проверка наличия 'Product ID' и других необходимых столбцов
+required_columns = ['Product ID', 'Air temperature (K)', 'Process temperature (K)',
+                    'Rotational speed (rpm)', 'Torque (Nm)', 'Tool wear (min)', 'Target', 'Failure Type']
+
+missing_columns = [col for col in required_columns if col not in df.columns]
+if missing_columns:
+    raise KeyError(f"Отсутствуют необходимые столбцы: {missing_columns}")
+
+df['RUL'] = df['Tool wear (min)'].max() - df['Tool wear (min)']
+
+print(df['RUL'].head())
+
+df_dummies = pd.get_dummies(df["Type"], prefix="Type")
+df = pd.concat([df, df_dummies], axis=1)
+
+df_dummies2 = pd.get_dummies(df["Failure Type"])
+df = pd.concat([df, df_dummies2], axis=1)
+
+# Выбор признаков для предсказания RUL и отказов
+feature_columns = ['Air temperature (K)', 'Process temperature (K)', 'Rotational speed (rpm)',
+                   'Torque (Nm)', 'Tool wear (min)', 'Type_H', 'Type_L', 'Type_M']
+# feature_columns_new = ['Air temperature (K)', 'Process temperature (K)', 'Rotational speed (rpm)',
+#                    'Torque (Nm)', 'Tool wear (min)', 'Type_H', 'Type_L', 'Type_M', 'Target',
+#                        'FType_Heat Dissipation Failure', 'FType_No Failure', 'FType_Overstrain Failure',
+# 'FType_Power Failure', 'FType_Random Failures', 'FType_Tool Wear Failure', 'RUL']
+failure_types = ['Heat Dissipation Failure', 'No Failure', 'Overstrain Failure',
+'Power Failure', 'Random Failures', 'Tool Wear Failure']
+X = df[feature_columns]
+y_failure = df['Target']  # Бинарная цель для предсказания отказа
+y_rul = df['RUL']  # Целевая переменная для RUL
+y_fail_type = df[failure_types]  # Целевая переменная для предсказания типа отказа
+
+# Разделение данных на тренировочные и тестовые выборки
+X_train, X_test, y_train_failure, y_test_failure, y_train_rul, y_test_rul, y_train_fail_type, y_test_fail_type = train_test_split(
+    X, y_failure, y_rul, y_fail_type, test_size=0.2, random_state=42
+)
+
+num_failure_types = len(failure_types)  # Количество классов типов отказов
+
+rf_failure = RandomForestClassifier(n_estimators=100)
+rf_failure.fit(X_train, y_train_failure)
+rf_failure_type = RandomForestClassifier(n_estimators=100)
+rf_failure_type.fit(X_train, y_train_fail_type)
+# RUL
+rf_rul = RandomForestRegressor(n_estimators=100)
+rf_rul.fit(X_train, y_train_rul)
+
+# Предсказания на тренировочных данных
+rf_failure_pred = rf_failure.predict_proba(X_train)[:, 1]  # Вероятность отказа
+rf_failure_type_pred = rf_failure_type.predict(X_train)    # Тип отказа
+rf_rul_pred = rf_rul.predict(X_train)  # RUL
+
+# Анализ важности признаков
+importances = rf_failure.feature_importances_
+feature_importance = pd.Series(importances, index=X_train.columns)
+feature_importance.sort_values(ascending=False).plot(kind='bar')
+print(feature_importance)
+
+
+# Добавление предсказаний RF к исходным данным
+X_train['RF_Failure_Prob'] = rf_failure_pred
+X_train['RF_RUL_Pred'] = rf_rul_pred
+
+# Предсказания на тестовых данных
+y_pred_failure_rf = rf_failure.predict(X_test)
+y_pred_failure_type_rf = rf_failure_type.predict(X_test)
+y_pred_rul_rf = rf_rul.predict(X_test)
+
+# Точность для бинарной классификации отказа
+accuracy_rf_failure = accuracy_score(y_test_failure, y_pred_failure_rf)
+print(f"Accuracy RF (Failure): {accuracy_rf_failure:.4f}")
+
+# Преобразование истинных меток и предсказаний в индексы классов
+y_test_failure_type_indices = y_test_fail_type.values.argmax(axis=1)  # Преобразование истинных меток в индексы
+y_pred_failure_type_rf_indices = y_pred_failure_type_rf.argmax(axis=1)  # Преобразование предсказаний в индексы
+
+# Точность для многоклассовой классификации типов отказов
+classification_report_rf = classification_report(y_test_failure_type_indices, y_pred_failure_type_rf_indices)
+print("Classification Report RF (Failure Type):\n", classification_report_rf)
+
+# Ошибки для предсказания RUL
+mse_rf_rul = mean_squared_error(y_test_rul, y_pred_rul_rf)
+mae_rf_rul = mean_absolute_error(y_test_rul, y_pred_rul_rf)
+print(f"MSE RF (RUL): {mse_rf_rul:.4f}")
+print(f"MAE RF (RUL): {mae_rf_rul:.4f}")
+
+# print(rf_failure_type_pred)
+#
+# X_train['RF_pred'] =
+# X_train[failure_types] =
+# X_train['RF_rul'] = rf_rul_pred
+
+print(X_train)
+
+# Масштабирование данных для LSTM
+scaler = StandardScaler()
+
+X_train_scaled = scaler.fit_transform(X_train)
+
+# Функция для создания окон данных
+def create_lstm_sequences(data, time_steps):
+    sequences = []
+    for i in range(len(data) - time_steps + 1):
+        # Создаём окно данных длиной time_steps
+        sequences.append(data[i:i + time_steps])
+    return np.array(sequences)
+
+
+# Создание окон данных для LSTM
+time_steps = 10  # Длина окна
+X_lstm_train = create_lstm_sequences(X_train_scaled, time_steps)
+
+# Обрезаем метки, чтобы они соответствовали количеству образцов в X_lstm_train
+y_train_failure = y_train_failure[time_steps - 1:]
+y_train_fail_type = y_train_fail_type[time_steps - 1:]
+y_train_rul = y_train_rul[time_steps - 1:]
+
+# Проверка, что размеры совпадают
+print(f"Shape of X_lstm_train: {X_lstm_train.shape}")
+print(f"Shape of y_train_failure: {y_train_failure.shape}")
+print(f"Shape of y_train_fail_type: {y_train_fail_type.shape}")
+print(f"Shape of y_train_rul: {y_train_rul.shape}")
+
+# # X_test_scaled = scaler.transform(X_test)
+#
+# # Преобразуем данные для подачи в LSTM (например, развернем в последовательности, если нужно)
+# X_lstm_train = X_train_scaled.reshape(X_train_scaled.shape[0], time_steps, X_train_scaled.shape[1])
+
+# Функция для создания скользящего окна данных
+def create_rolling_window(data, time_steps):
+    if len(data) < time_steps:
+        return None  # Недостаточно данных для создания окна
+    return np.array([data[-time_steps:]])
+
+# Список для хранения поступающих данных
+data_buffer = []
+
+# Функция для добавления новых данных и формирования окна
+def add_new_data_and_get_window(new_row):
+    data_buffer.append(new_row)  # Добавляем новую строку данных
+    if len(data_buffer) > time_steps:
+        data_buffer.pop(0)  # Удаляем самую старую строку, чтобы сохранить размер окна
+    return create_rolling_window(data_buffer, time_steps)
+
+# Строим многозадачную LSTM модель для предсказания отказов, типов отказов и RUL
+# input_shape = (X_lstm_train.shape[1], X_lstm_train.shape[2])
+input_shape=(X_lstm_train.shape[1], X_lstm_train.shape[2])
+
+def build_multitask_lstm_model(input_shape, num_failure_types):
+    from keras.layers import Input as inp
+    inputs = inp(shape=input_shape)
+
+    # LSTM слои
+    x = LSTM(units=64, return_sequences=True)(inputs)# Увеличили количество нейронов
+    x = Dropout(0.3)(x)# Увеличили Dropout для предотвращения переобучения
+    x = LSTM(units=64)(x)# Второй слой LSTM
+    x = Dropout(0.3)(x)
+
+    # Выход для предсказания отказов (бинарная классификация)
+    failure_output = Dense(1, activation='sigmoid', name='failure_output')(x)
+
+    # Выход для предсказания типов отказов (многоклассовая классификация)
+    failure_type_output = Dense(num_failure_types, activation='softmax', name='failure_type_output')(x)
+
+    # Выход для предсказания RUL (регрессия)
+    rul_output = Dense(1, activation='linear', name='rul_output')(x)
+
+    # Модель с тремя выходами
+    model = Model(inputs=inputs, outputs=[failure_output, failure_type_output, rul_output])
+
+    # Компиляция модели с тремя функциями потерь
+    model.compile(optimizer=Adam(learning_rate=0.001),
+                  loss={'failure_output': 'binary_crossentropy',
+                        'failure_type_output': 'categorical_crossentropy',
+                        'rul_output': 'mean_squared_error'},
+                  metrics={'failure_output': 'accuracy',
+                           'failure_type_output': 'accuracy',
+                           'rul_output': 'mean_absolute_error'},
+                  loss_weights={'failure_output': 1.0, 'failure_type_output': 0.8, 'rul_output': 0.5})  # Веса потерь
+
+    return model
+
+multitask_lstm_model = build_multitask_lstm_model(input_shape, num_failure_types)
+
+# Обучаем LSTM на предсказаниях Random Forest
+multitask_lstm_model.fit(X_lstm_train,
+                         {'failure_output': y_train_failure,
+                          'failure_type_output': y_train_fail_type,
+                          'rul_output': y_train_rul},
+                         epochs=50, batch_size=32, verbose=2)
+
+# Предсказания на тестовых данных с LSTM
+y_pred_failure_lstm, y_pred_failure_type_lstm, y_pred_rul_lstm = multitask_lstm_model.predict(X_lstm_train)
+
+# Преобразование вероятностей в классы для бинарной классификации отказа
+y_pred_failure_lstm = (y_pred_failure_lstm > 0.5).astype(int)  # Бинарные предсказания
+
+# Преобразование многоклассовых предсказаний и истинных меток в индексы классов
+y_pred_failure_type_lstm = y_pred_failure_type_lstm.argmax(axis=1)  # Предсказания моделей LSTM
+y_test_failure_type = y_train_fail_type.values.argmax(axis=1)  # Истинные метки
+
+# Точность для бинарной классификации отказа
+accuracy_lstm_failure = accuracy_score(y_train_failure, y_pred_failure_lstm)
+print(f"Accuracy LSTM (Failure): {accuracy_lstm_failure:.4f}")
+
+# Точность для многоклассовой классификации типов отказов
+classification_report_lstm = classification_report(y_test_failure_type, y_pred_failure_type_lstm)
+print("Classification Report LSTM (Failure Type):\n", classification_report_lstm)
+
+# Ошибки для предсказания RUL
+mse_lstm_rul = mean_squared_error(y_train_rul, y_pred_rul_lstm)
+mae_lstm_rul = mean_absolute_error(y_train_rul, y_pred_rul_lstm)
+print(f"MSE LSTM (RUL): {mse_lstm_rul:.4f}")
+print(f"MAE LSTM (RUL): {mae_lstm_rul:.4f}")
+
+air_temp_list = []
+process_temp_list = []
+rotational_speed_list = []
+torque_list = []
+tool_wear_list = []
+
+# Функция для генерации синтетических данных с редкими отказами и соответствующим RUL
+def generate_synthetic_data(num_samples=1):
+    if not air_temp_list:
+        air_temp = 300.0
+        process_temp = 310.0
+        rotational_speed = 1539
+        torque = 40.0
+        tool_wear = 0
+    else:
+        air_temp = air_temp_list[0]
+        process_temp = process_temp_list[0]
+        rotational_speed = rotational_speed_list[0]
+        torque = torque_list[0]
+        tool_wear = tool_wear_list[0]
+    generated_data = []
+    for _ in range(num_samples):
+        # Постепенное изменение параметров
+        air_temp += np.random.normal(0, 0.1)
+        process_temp += np.random.normal(0, 0.1)
+        rotational_speed += np.random.normal(0, 5)
+        torque += np.random.normal(0, 0.5)
+        tool_wear += 0.5
+
+        # Резкие изменения температуры и крутящего момента с малой вероятностью
+        if np.random.rand() < 0.05:
+            air_temp += np.random.uniform(10, 20)
+            torque += np.random.uniform(5, 10)
+
+        # Определяем тип инструмента случайным образом
+        type_h, type_l, type_m = 0, 0, 0
+        rand_type = random.randint(0, 3)
+        if rand_type == 0:
+            type_h = 1
+        elif rand_type == 1:
+            type_l = 1
+        else:
+            type_m = 1
+
+        new_row = {
+            'Air temperature (K)': air_temp,
+            'Process temperature (K)': process_temp,
+            'Rotational speed (rpm)': rotational_speed,
+            'Torque (Nm)': torque,
+            'Tool wear (min)': tool_wear,
+            'Type_H': type_h,
+            'Type_L': type_l,
+            'Type_M': type_m,
+        }
+        generated_data.append(new_row)
+
+    air_temp_list.clear()
+    process_temp_list.clear()
+    rotational_speed_list.clear()
+    torque_list.clear()
+    tool_wear_list.clear()
+
+    air_temp_list.append(air_temp)
+    process_temp_list.append(process_temp)
+    rotational_speed_list.append(rotational_speed)
+    torque_list.append(torque)
+    tool_wear_list.append(tool_wear)
+
+    return pd.DataFrame(generated_data)
+
+# Функция для предсказания вероятности отказа с помощью LSTM
+def multitask_lstm_predict(data):
+    # Предсказания на новых данных
+    y_pred_failure_lstm, y_pred_failure_type_lstm, y_pred_rul_lstm = multitask_lstm_model.predict(data)
+    return y_pred_failure_lstm[0][0], y_pred_failure_type_lstm, y_pred_rul_lstm[0][0]
+
+# Визуализация данных в Dash
+app.layout = html.Div([
+    html.H1('Предсказание отказов и RUL оборудования в реальном времени', style={'text-align': 'center'}),
+    html.Div(id='live-update-text', style={'text-align': 'center'}),
+    dcc.Graph(id='failure-probability-graph'),
+    dcc.Graph(id='rul-graph'),
+    # dcc.Graph(id='shap-graph'),
+    dcc.Interval(
+        id='interval-component',
+        interval=5 * 1000,  # 5 секунд
+        n_intervals=0
+    )
+])
+
+# Списки для хранения времени и предсказаний
+times = []
+predictions_failure = []
+predictions_rul = []
+predictions_fail_type = []
+
+
+# Функция для добавления новых данных в CSV и обучения модели
+def add_to_csv_synthetic():
+    new_data = generate_synthetic_data(num_samples=1)
+
+    # Шаг 1: Получение предсказаний от RF для новых данных
+    rf_failure_pred_new = rf_failure.predict_proba(new_data)[0, 1]  # Вероятность отказа
+    rf_rul_pred_new = rf_rul.predict(new_data)[0]  # Предсказание RUL
+
+    # Шаг 2: Добавление предсказаний RF к новым данным
+    new_data['RF_Failure_Prob'] = rf_failure_pred_new
+    new_data['RF_RUL_Pred'] = rf_rul_pred_new
+
+    # rf_failure_pred_newdata = rf_failure.predict_proba(new_data)[:, 1]  # Вероятность отказа
+    # rf_failure_type_pred_newdata = rf_failure_type.predict(new_data)  # Тип отказа
+    # rf_rul_pred_newdata = rf_rul.predict(new_data)  # RUL
+    #
+    # new_data['RF_pred'] = rf_failure_pred_newdata
+    # new_data[failure_types] = rf_failure_type_pred_newdata
+    # new_data['RF_rul'] = rf_rul_pred_newdata
+
+    new_data.to_csv(new_data_from_sensors, mode='a', header=False, index=False)
+    # update_model_with_new_data(new_data)
+
+# Функция для чтения последних данных и создания окна
+def get_scaled_rolling_window(time_steps):
+    # Чтение последних time_steps строк из CSV
+    recent_data = pd.read_csv(new_data_from_sensors).tail(time_steps)
+
+    # Масштабирование данных
+    recent_data_scaled = scaler.transform(recent_data)
+
+    # Преобразование в окно данных для LSTM
+    if len(recent_data_scaled) < time_steps:
+        return None  # Недостаточно данных для создания окна
+    return recent_data_scaled.reshape(1, time_steps, recent_data_scaled.shape[1])
+
+
+# Callback для обновления графиков
+@app.callback(
+    Output('failure-probability-graph', 'figure'),
+    Output('rul-graph', 'figure'),
+    # Output('shap-graph', 'figure'),
+    Output('live-update-text', 'children'),
+    Input('interval-component', 'n_intervals')
+)
+def update_graph(n_intervals):
+    # Генерация и добавление новых данных
+    add_to_csv_synthetic()
+
+    # Получение окна данных для LSTM
+    rolling_window = get_scaled_rolling_window(time_steps)
+
+    # Чтение последних данных
+    # new_data = pd.read_csv(new_data_from_sensors).tail(1)
+    # new_data_scaled = scaler.transform(new_data)
+    # new_data_lstm = new_data_scaled.reshape(new_data_scaled.shape[0], time_steps, new_data_scaled.shape[1])
+    # rolling_window = add_new_data_and_get_window(new_data_lstm)
+    # X_new_scaled = scaler.transform(X_new)
+    # X_new_lstm = X_new_scaled.reshape(1, time_steps, len(feature_columns_new))
+
+    # print(f"X_new_lstm: {X_new}")
+
+    # from sklearn.metrics import classification_report
+    #
+    # # Предсказания на тестовом наборе
+    # y_pred = multitask_lstm_model.predict(X_new_lstm)[0]
+    # y_pred = [1 if p >= 0.5 else 0 for p in y_pred]  # Преобразование вероятностей в классы
+    #
+    # # Оценка метрик
+    # print(classification_report(X_new_lstm, y_pred))
+
+    if rolling_window is not None:
+        # Предсказания с использованием LSTM
+        failure_pred, failure_type_pred, rul_pred = multitask_lstm_model.predict(rolling_window)
+
+        # Обработка предсказаний
+        current_time = datetime.datetime.now()
+        times.append(current_time)
+        predictions_failure.append(failure_pred[0][0])
+        predictions_rul.append(rul_pred[0][0])
+        # predictions_fail_type.append(failure_type_pred)
+
+        # Применение правила монотонности к предсказаниям RUL
+        if len(predictions_rul) > 1 and predictions_rul[-1] > predictions_rul[-2]:
+            predictions_rul[-1] = predictions_rul[-2]  # Ограничение, чтобы RUL не увеличивался
+
+        # # Ограничение количества точек на графике (например, только последние 100 точек)
+        # if len(times) > 100:
+        #     times.pop(0)
+        #     predictions_failure.pop(0)
+        #     predictions_rul.pop(0)
+
+        # Построение графика вероятности отказа
+        failure_fig = go.Figure()
+        failure_fig.add_trace(
+            go.Scatter(x=times, y=predictions_failure, mode='lines+markers', name='Вероятность отказа', line=dict(color='green', width=3)))
+        failure_fig.update_layout(
+            title='Предсказание вероятности отказа оборудования',
+            xaxis_title='Время',
+            yaxis_title='Вероятность отказа',
+            hovermode="x unified",
+            xaxis_rangeslider_visible=True,
+            yaxis_tickformat='.4f',
+            autosize=True,
+            height=600,
+            legend=dict(title="Параметры", orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=40, r=40, t=40, b=40)
+        )
+
+        # Построение графика RUL
+        rul_fig = go.Figure()
+        rul_fig.add_trace(go.Scatter(x=times, y=predictions_rul, mode='lines+markers', name='Остаточный срок службы (RUL)', line=dict(color='red', width=3)))
+        rul_fig.update_layout(
+            title='Предсказание остаточного срока службы (RUL)',
+            xaxis_title='Время',
+            yaxis_title='RUL (минуты)',
+            hovermode="x unified",
+            xaxis_rangeslider_visible=True,
+            yaxis_tickformat='.2f',
+            autosize=True,
+            height=600,
+            legend=dict(title="Параметры", orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=40, r=40, t=40, b=40)
+        )
+
+        # # Построение графика failure type
+        # ftype_fig = go.Figure()
+        # ftype_fig.add_trace(go.Bar(x=failure_types, y=failure_type_pred[0], name='Возможный тип отказа'))
+        # ftype_fig.update_layout(
+        #     title='Предсказание наиболее возможного типа отказа',
+        #     xaxis_title='Тип отказа',
+        #     yaxis_title='Вероятность отказа',
+        #     hovermode="x unified",
+        #     xaxis_rangeslider_visible=True,
+        #     yaxis_tickformat='.2f',
+        #     autosize=True,
+        #     height=600,
+        #     legend=dict(title="Параметры", orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        #     margin=dict(l=40, r=40, t=40, b=40)
+        # )
+
+        # Создание текста с метриками
+        metrics_text = f'''
+            Вероятность отказа: {failure_pred[0][0]:.4f}
+            Остаточный срок службы (RUL): {rul_pred[0][0]:.2f} минуты
+            '''
+
+        # # Создание текста с метриками
+        # metrics_text = f'''
+        #             Вероятность отказа: {failure_pred[0][0]:.4f}
+        #             Тип отказа: {failure_types[np.where(failure_type_pred[0] == failure_type_pred[0].max())[0][0]]}
+        #             Остаточный срок службы (RUL): {rul_pred[0][0]:.2f} минуты
+        #             '''
+
+        # return failure_fig, rul_fig, ftype_fig, shap_graph, html.Div(metrics_text, style={'text-align': 'center', 'fontSize': '24px'})
+        return failure_fig, rul_fig, html.Div(metrics_text, style={'text-align': 'center', 'fontSize': '24px'})
+
+    # failure_pred, failure_type_pred, rul_pred = multitask_lstm_predict(new_data_lstm)
+
+    return go.Figure(), go.Figure(), html.Div("Недостаточно данных для предсказаний", style={'text-align': 'center', 'fontSize': '24px'})
+
+
+
+    # rul_pred_unscaled = scaler.inverse_transform(rul_pred.reshape(-1, 1))
+
+
+
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
